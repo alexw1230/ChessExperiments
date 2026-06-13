@@ -1,9 +1,10 @@
 import chess
 import random
+import time
 MATE = 1000000000
 class ClassicalEngine:
 
-    def __init__(self, depth=3):
+    def __init__(self, depth=4):
 
         self.depth = depth
 
@@ -19,6 +20,9 @@ class ClassicalEngine:
         self.init_zobrist()
         self.tt = {}
         self.history = {}
+        self.nodes = 0
+        self.qnodes = 0
+        self.pv_move = None
         self.killer_moves = {}  # depth -> [move1, move2]
         self.pst = {
     chess.PAWN: [
@@ -126,6 +130,17 @@ class ClassicalEngine:
             return value[square]
         else:
             return value[chess.square_mirror(square)]
+    def see_score(self, board, move):
+        if not board.is_capture(move):
+            return 0
+
+        from_piece = board.piece_at(move.from_square)
+        to_piece = board.piece_at(move.to_square)
+
+        if not from_piece or not to_piece:
+            return 0
+
+        return self.piece_values[to_piece.piece_type] - self.piece_values[from_piece.piece_type]
     def is_quiet(self, board):
 
         # If any capture exists, it's not quiet
@@ -134,25 +149,52 @@ class ClassicalEngine:
                 return False
 
         return True
-    def quiescence(self, board, alpha, beta):
+    def quiescence(self, board, alpha, beta, depth):
+        self.qnodes += 1
+
+        # -------------------------------------------------
+        # HARD STOP (FIX 3: depth cap for quiescence)
+        # -------------------------------------------------
+        if depth >= 6:
+            return self.evaluate(board)
 
         stand_pat = self.evaluate(board)
-
-        # Max node (white)
+        DELTA_MARGIN = 200
+        # -------------------------------------------------
+        # MAX NODE (WHITE)
+        # -------------------------------------------------
         if board.turn == chess.WHITE:
 
             if stand_pat >= beta:
                 return beta
 
-            if alpha < stand_pat:
-                alpha = stand_pat
+            alpha = max(alpha, stand_pat)
 
-            moves = [m for m in board.legal_moves if board.is_capture(m)]
+            # only consider "good enough" captures (delta pruning light)
+            moves = [
+            m for m in board.legal_moves
+            if board.is_capture(m)
+            and self.see_score(board, m) >= -50   # threshold tunable
+            ]
+
+            # MVV-LVA style ordering (simple but effective)
+            moves.sort(
+                key=lambda m: self.see_score(board, m),
+                reverse=True
+            )
 
             for move in moves:
+                captured = board.piece_at(move.to_square)
 
+                captured_value = (
+                    self.piece_values[captured.piece_type]
+                    if captured else 0
+                )
+
+                if stand_pat + captured_value + DELTA_MARGIN < alpha:
+                    continue
                 board.push(move)
-                score = self.quiescence(board, alpha, beta)
+                score = self.quiescence(board, alpha, beta, depth + 1)
                 board.pop()
 
                 if score > alpha:
@@ -163,21 +205,39 @@ class ClassicalEngine:
 
             return alpha
 
-        # Min node (black)
+        # -------------------------------------------------
+        # MIN NODE (BLACK)
+        # -------------------------------------------------
         else:
 
             if stand_pat <= alpha:
                 return alpha
 
-            if beta > stand_pat:
-                beta = stand_pat
+            beta = min(beta, stand_pat)
 
-            moves = [m for m in board.legal_moves if board.is_capture(m)]
+            moves = [
+                m for m in board.legal_moves
+                if board.is_capture(m)
+                and self.see_score(board, m) >= 0
+            ]
+
+            moves.sort(
+                key=lambda m: self.see_score(board, m),
+                reverse=True
+            )
 
             for move in moves:
+                captured = board.piece_at(move.to_square)
 
+                captured_value = (
+                    self.piece_values[captured.piece_type]
+                    if captured else 0
+                )
+
+                if stand_pat - captured_value - DELTA_MARGIN > beta:
+                    continue
                 board.push(move)
-                score = self.quiescence(board, alpha, beta)
+                score = self.quiescence(board, alpha, beta, depth + 1)
                 board.pop()
 
                 if score < beta:
@@ -190,17 +250,19 @@ class ClassicalEngine:
     def order_moves(self, board, moves, depth):
 
         def score_move(move):
-
+            if self.pv_move is not None and move == self.pv_move:
+                return 100000000
             score = 0
             move_key = move.uci()
 
             # --------------------------------------------------
             # 1. TRANSPOSITION TABLE BEST MOVE (VERY IMPORTANT)
             # --------------------------------------------------
-            key = self.compute_hash(board)
-            if key in self.tt:
-                # optional: you can later store best move separately
-                pass
+            # if depth >= 3:
+            #     key = self.compute_hash(board)
+            #     if key in self.tt:
+            #         # optional: you can later store best move separately
+            #         pass
 
             # --------------------------------------------------
             # 2. KILLER MOVES (depth-specific tactical moves)
@@ -219,25 +281,18 @@ class ClassicalEngine:
             # 4. CAPTURES (MVV-LVA style)
             # --------------------------------------------------
             if board.is_capture(move):
+                if self.see_score(board, move) < 0:
+                    score -= 10000   # blunder capture
+                else:
+                    score += 500
 
-                captured_piece = board.piece_at(move.to_square)
-                attacker_piece = board.piece_at(move.from_square)
-
-                if captured_piece:
-                    score += self.piece_values[captured_piece.piece_type]
-
-                if attacker_piece:
-                    score -= self.piece_values[attacker_piece.piece_type]
-
-                score += 10000  # strong capture priority
-
-            # --------------------------------------------------
-            # 5. CHECKS
-            # --------------------------------------------------
-            board.push(move)
-            if board.is_check():
-                score += 5000
-            board.pop()
+            # # --------------------------------------------------
+            # # 5. CHECKS
+            # # --------------------------------------------------
+            # board.push(move)
+            # if board.is_check():
+            #     score += 5000
+            # board.pop()
 
             # --------------------------------------------------
             # 6. CENTER CONTROL
@@ -256,8 +311,30 @@ class ClassicalEngine:
         best_move = None
         best_value = -float("inf") if is_maximizing else float("inf")
 
+        key = self.compute_hash(board)
+
+        # -------------------------------------------------
+        # TT MOVE (SAFE EXTRACTION)
+        # -------------------------------------------------
+        tt_move = None
+        if key in self.tt:
+            entry = self.tt[key]
+            if len(entry) == 3:
+                tt_move = entry[2]
+
+        # -------------------------------------------------
+        # MOVE ORDERING
+        # -------------------------------------------------
         legal_moves = self.order_moves(board, list(board.legal_moves), depth)
 
+        # boost TT move to front (if valid)
+        if tt_move in legal_moves:
+            legal_moves.remove(tt_move)
+            legal_moves.insert(0, tt_move)
+
+        # -------------------------------------------------
+        # SEARCH LOOP
+        # -------------------------------------------------
         for move in legal_moves:
 
             board.push(move)
@@ -282,9 +359,7 @@ class ClassicalEngine:
                     best_move = move
 
         return best_move, best_value
-    # ==========================================
-    # EVALUATION FUNCTION
-    # ==========================================
+
     def evaluate(self, board: chess.Board) -> int:
 
         # ==========================================
@@ -292,11 +367,10 @@ class ClassicalEngine:
         # ==========================================
 
         if board.is_checkmate():
-            # side to move is checkmated
             if board.turn == chess.WHITE:
-                return -MATE  # white is losing
+                return -MATE - self.depth
             else:
-                return MATE   # black is losing
+                return MATE + self.depth
 
         if board.is_stalemate():
             return 0
@@ -327,33 +401,31 @@ class ClassicalEngine:
                 score -= self.pst_value(piece_type, square, chess.BLACK)
 
         return score
-
-    # ==========================================
-    # MINIMAX
-    # ==========================================
+    
     def alphabeta(self, board, depth, alpha, beta, is_maximizing):
-
-        key = self.compute_hash(board)
+        self.nodes += 1
+        if depth >= 3:
+            key = self.compute_hash(board)
 
         # -----------------------------------
         # TRANSPOSITION TABLE LOOKUP (simple)
         # -----------------------------------
-        if depth >= 2 and key in self.tt:
-            stored_depth, stored_value = self.tt[key]
-            if stored_depth == depth:
-                return stored_value
+            if depth >= 3 and key in self.tt:
+                stored_depth, stored_value = self.tt[key]
+                if stored_depth >= depth:
+                    return stored_value
 
         # -----------------------------------
         # TERMINAL / LEAF CONDITIONS
         # -----------------------------------
         if board.is_checkmate():
-            return -MATE if board.turn == chess.WHITE else MATE
+            return -MATE + (1000 - depth) if board.turn == chess.WHITE else MATE - (1000 - depth)
 
         if board.is_stalemate() or board.is_insufficient_material():
             return 0
 
         if depth == 0:
-            return self.quiescence(board, alpha, beta)
+            return self.quiescence(board, alpha, beta, depth=0)
 
         # -----------------------------------
         # MOVE ORDERING
@@ -406,8 +478,8 @@ class ClassicalEngine:
                     self.killer_moves[depth_key] = self.killer_moves[depth_key][:2]
 
                     break
-
-            self.tt[key] = (depth, max_eval)
+            if depth >= 3:
+                self.tt[key] = (depth, max_eval, legal_moves[0] if legal_moves else None)
             return max_eval
 
         # ======================================================
@@ -457,56 +529,59 @@ class ClassicalEngine:
 
                     break
 
-            self.tt[key] = (depth, min_eval)
+            if depth >= 3:
+                self.tt[key] = (depth, min_eval, legal_moves[0] if legal_moves else None)
             return min_eval
 
-    # ==========================================
-    # GET BEST MOVE
-    # ==========================================
     def get_move(self, board):
 
+        start = time.time()
+        self.nodes = 0
+        self.qnodes = 0
         legal_moves = list(board.legal_moves)
 
         if not legal_moves:
             print("[ENGINE] No legal moves!")
             return None
 
-        best_move = legal_moves[0]   # IMPORTANT fallback
+        if len(legal_moves) == 1:
+            return legal_moves[0]
+
         is_maximizing = (board.turn == chess.WHITE)
 
-        best_value = -float("inf") if is_maximizing else float("inf")
+        # reset PV move for this position
+        self.pv_move = None
 
-        alpha = -float("inf")
-        beta = float("inf")
+        best_move = legal_moves[0]
+        best_value = 0
 
         print(f"[ENGINE ROOT] evaluating {len(legal_moves)} moves")
 
-        for move in legal_moves:
+        for current_depth in range(1, self.depth + 1):
 
-            board.push(move)
-
-            value = self.alphabeta(
+            move, value = self.search(
                 board,
-                self.depth - 1,
-                alpha,
-                beta,
-                not is_maximizing
+                current_depth,
+                is_maximizing
             )
 
-            board.pop()
+            if move is not None:
+                best_move = move
+                best_value = value
 
-            print(f"Move {move} -> {value}")
+                # use previous iteration's best move
+                # for move ordering in the next iteration
+                self.pv_move = move
 
-            # FORCE SAFE COMPARISON (important)
-            if is_maximizing:
-                if value > best_value:
-                    best_value = value
-                    best_move = move
-            else:
-                if value < best_value:
-                    best_value = value
-                    best_move = move
+            print(
+                f"[ITERATION {current_depth}] "
+                f"{best_move} -> {best_value}"
+            )
+
+        elapsed = time.time() - start
 
         print(f"[ENGINE CHOSEN] {best_move} with value {best_value}")
+        print(f"[NODES SEARCHED] {self.nodes} in {elapsed:.4f} seconds")
+        print(f"[Q NODES] {self.qnodes}")
 
         return best_move

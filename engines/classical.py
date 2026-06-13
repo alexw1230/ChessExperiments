@@ -1,8 +1,9 @@
 import chess
-
+import random
+MATE = 1000000000
 class ClassicalEngine:
 
-    def __init__(self, depth=5):
+    def __init__(self, depth=3):
 
         self.depth = depth
 
@@ -14,15 +15,209 @@ class ClassicalEngine:
             chess.QUEEN: 900,
             chess.KING: 0
         }
-    def order_moves(self, board, moves):
+        self.zobrist_table = {}
+        self.init_zobrist()
+        self.tt = {}
+        self.history = {}
+        self.killer_moves = {}  # depth -> [move1, move2]
+        self.pst = {
+    chess.PAWN: [
+         0,  0,  0,  0,  0,  0,  0,  0,
+        50, 50, 50, 50, 50, 50, 50, 50,
+        10, 10, 20, 30, 30, 20, 10, 10,
+         5,  5, 10, 25, 25, 10,  5,  5,
+         0,  0,  0, 20, 20,  0,  0,  0,
+         5, -5,-10,  0,  0,-10, -5,  5,
+         5, 10, 10,-20,-20, 10, 10,  5,
+         0,  0,  0,  0,  0,  0,  0,  0,
+    ],
+
+    chess.KNIGHT: [
+        -50,-40,-30,-30,-30,-30,-40,-50,
+        -40,-20,  0,  0,  0,  0,-20,-40,
+        -30,  0, 10, 15, 15, 10,  0,-30,
+        -30,  5, 15, 20, 20, 15,  5,-30,
+        -30,  0, 15, 20, 20, 15,  0,-30,
+        -30,  5, 10, 15, 15, 10,  5,-30,
+        -40,-20,  0,  5,  5,  0,-20,-40,
+        -50,-40,-30,-30,-30,-30,-40,-50,
+    ],
+
+    chess.BISHOP: [
+        -20,-10,-10,-10,-10,-10,-10,-20,
+        -10,  0,  0,  0,  0,  0,  0,-10,
+        -10,  0,  5, 10, 10,  5,  0,-10,
+        -10,  5,  5, 10, 10,  5,  5,-10,
+        -10,  0, 10, 10, 10, 10,  0,-10,
+        -10, 10, 10, 10, 10, 10, 10,-10,
+        -10,  5,  0,  0,  0,  0,  5,-10,
+        -20,-10,-10,-10,-10,-10,-10,-20,
+    ],
+
+    chess.ROOK: [
+         0,  0,  0,  5,  5,  0,  0,  0,
+        -5,  0,  0,  0,  0,  0,  0, -5,
+        -5,  0,  0,  0,  0,  0,  0, -5,
+        -5,  0,  0,  0,  0,  0,  0, -5,
+        -5,  0,  0,  0,  0,  0,  0, -5,
+        -5,  0,  0,  0,  0,  0,  0, -5,
+         5, 10, 10, 10, 10, 10, 10,  5,
+         0,  0,  0,  0,  0,  0,  0,  0,
+    ],
+
+    chess.QUEEN: [
+        -20,-10,-10, -5, -5,-10,-10,-20,
+        -10,  0,  0,  0,  0,  0,  0,-10,
+        -10,  0,  5,  5,  5,  5,  0,-10,
+         -5,  0,  5,  5,  5,  5,  0, -5,
+          0,  0,  5,  5,  5,  5,  0, -5,
+        -10,  5,  5,  5,  5,  5,  0,-10,
+        -10,  0,  5,  0,  0,  0,  0,-10,
+        -20,-10,-10, -5, -5,-10,-10,-20,
+    ],
+
+    chess.KING: [
+        -30,-40,-40,-50,-50,-40,-40,-30,
+        -30,-40,-40,-50,-50,-40,-40,-30,
+        -30,-40,-40,-50,-50,-40,-40,-30,
+        -30,-40,-40,-50,-50,-40,-40,-30,
+        -20,-30,-30,-40,-40,-30,-30,-20,
+        -10,-20,-20,-20,-20,-20,-20,-10,
+         20, 20,  0,  0,  0,  0, 20, 20,
+         20, 30, 10,  0,  0, 10, 30, 20,
+    ]
+}
+    def init_zobrist(self):
+
+        pieces = [
+            chess.PAWN, chess.KNIGHT, chess.BISHOP,
+            chess.ROOK, chess.QUEEN, chess.KING
+        ]
+
+        self.zobrist_table = {}
+
+        for square in chess.SQUARES:
+            for piece in pieces:
+                self.zobrist_table[(piece, chess.WHITE, square)] = random.getrandbits(64)
+                self.zobrist_table[(piece, chess.BLACK, square)] = random.getrandbits(64)
+
+        self.zobrist_black_to_move = random.getrandbits(64)
+    def compute_hash(self, board):
+        h = 0
+
+        for square in chess.SQUARES:
+
+            piece = board.piece_at(square)
+
+            if piece:
+
+                h ^= self.zobrist_table[(piece.piece_type, piece.color, square)]
+
+        if board.turn == chess.BLACK:
+            h ^= self.zobrist_black_to_move
+
+        return h
+    def pst_value(self, piece_type, square, color):
+
+        value = self.pst[piece_type]
+
+        # flip board for black
+        if color == chess.WHITE:
+            return value[square]
+        else:
+            return value[chess.square_mirror(square)]
+    def is_quiet(self, board):
+
+        # If any capture exists, it's not quiet
+        for move in board.legal_moves:
+            if board.is_capture(move):
+                return False
+
+        return True
+    def quiescence(self, board, alpha, beta):
+
+        stand_pat = self.evaluate(board)
+
+        # Max node (white)
+        if board.turn == chess.WHITE:
+
+            if stand_pat >= beta:
+                return beta
+
+            if alpha < stand_pat:
+                alpha = stand_pat
+
+            moves = [m for m in board.legal_moves if board.is_capture(m)]
+
+            for move in moves:
+
+                board.push(move)
+                score = self.quiescence(board, alpha, beta)
+                board.pop()
+
+                if score > alpha:
+                    alpha = score
+
+                if alpha >= beta:
+                    break
+
+            return alpha
+
+        # Min node (black)
+        else:
+
+            if stand_pat <= alpha:
+                return alpha
+
+            if beta > stand_pat:
+                beta = stand_pat
+
+            moves = [m for m in board.legal_moves if board.is_capture(m)]
+
+            for move in moves:
+
+                board.push(move)
+                score = self.quiescence(board, alpha, beta)
+                board.pop()
+
+                if score < beta:
+                    beta = score
+
+                if beta <= alpha:
+                    break
+
+            return beta
+    def order_moves(self, board, moves, depth):
 
         def score_move(move):
 
             score = 0
+            move_key = move.uci()
 
-            # ----------------------------------
-            # CAPTURES (MVV-LVA style)
-            # ----------------------------------
+            # --------------------------------------------------
+            # 1. TRANSPOSITION TABLE BEST MOVE (VERY IMPORTANT)
+            # --------------------------------------------------
+            key = self.compute_hash(board)
+            if key in self.tt:
+                # optional: you can later store best move separately
+                pass
+
+            # --------------------------------------------------
+            # 2. KILLER MOVES (depth-specific tactical moves)
+            # --------------------------------------------------
+            if depth in self.killer_moves:
+                if move in self.killer_moves[depth]:
+                    score += 100000
+
+            # --------------------------------------------------
+            # 3. HISTORY HEURISTIC (global learned success)
+            # --------------------------------------------------
+            if move_key in self.history:
+                score += self.history[move_key]
+
+            # --------------------------------------------------
+            # 4. CAPTURES (MVV-LVA style)
+            # --------------------------------------------------
             if board.is_capture(move):
 
                 captured_piece = board.piece_at(move.to_square)
@@ -34,27 +229,59 @@ class ClassicalEngine:
                 if attacker_piece:
                     score -= self.piece_values[attacker_piece.piece_type]
 
-                score += 1000  # capture bonus
+                score += 10000  # strong capture priority
 
-            # ----------------------------------
-            # CHECKS
-            # ----------------------------------
+            # --------------------------------------------------
+            # 5. CHECKS
+            # --------------------------------------------------
             board.push(move)
             if board.is_check():
-                score += 500
+                score += 5000
             board.pop()
 
-            # ----------------------------------
-            # CENTER CONTROL
-            # ----------------------------------
-            center_squares = [27, 28, 35, 36]  # d4, e4, d5, e5
-
-            if move.to_square in center_squares:
+            # --------------------------------------------------
+            # 6. CENTER CONTROL
+            # --------------------------------------------------
+            if move.to_square in [27, 28, 35, 36]:
                 score += 50
 
             return score
 
         return sorted(moves, key=score_move, reverse=True)
+    def search(self, board, depth, is_maximizing):
+
+        alpha = -float("inf")
+        beta = float("inf")
+
+        best_move = None
+        best_value = -float("inf") if is_maximizing else float("inf")
+
+        legal_moves = self.order_moves(board, list(board.legal_moves), depth)
+
+        for move in legal_moves:
+
+            board.push(move)
+
+            value = self.alphabeta(
+                board,
+                depth - 1,
+                alpha,
+                beta,
+                not is_maximizing
+            )
+
+            board.pop()
+
+            if is_maximizing:
+                if value > best_value:
+                    best_value = value
+                    best_move = move
+            else:
+                if value < best_value:
+                    best_value = value
+                    best_move = move
+
+        return best_move, best_value
     # ==========================================
     # EVALUATION FUNCTION
     # ==========================================
@@ -67,9 +294,9 @@ class ClassicalEngine:
         if board.is_checkmate():
             # side to move is checkmated
             if board.turn == chess.WHITE:
-                return -float("inf")  # white is losing
+                return -MATE  # white is losing
             else:
-                return float("inf")   # black is losing
+                return MATE   # black is losing
 
         if board.is_stalemate():
             return 0
@@ -89,9 +316,15 @@ class ClassicalEngine:
 
         score = 0
 
-        for piece_type, value in self.piece_values.items():
-            score += len(board.pieces(piece_type, chess.WHITE)) * value
-            score -= len(board.pieces(piece_type, chess.BLACK)) * value
+        for piece_type, base_value in self.piece_values.items():
+
+            for square in board.pieces(piece_type, chess.WHITE):
+                score += base_value
+                score += self.pst_value(piece_type, square, chess.WHITE)
+
+            for square in board.pieces(piece_type, chess.BLACK):
+                score -= base_value
+                score -= self.pst_value(piece_type, square, chess.BLACK)
 
         return score
 
@@ -100,69 +333,153 @@ class ClassicalEngine:
     # ==========================================
     def alphabeta(self, board, depth, alpha, beta, is_maximizing):
 
-        if depth == 0 or board.is_game_over():
-            return self.evaluate(board)
+        key = self.compute_hash(board)
 
-        legal_moves = list(board.legal_moves)
+        # -----------------------------------
+        # TRANSPOSITION TABLE LOOKUP (simple)
+        # -----------------------------------
+        if depth >= 2 and key in self.tt:
+            stored_depth, stored_value = self.tt[key]
+            if stored_depth == depth:
+                return stored_value
 
+        # -----------------------------------
+        # TERMINAL / LEAF CONDITIONS
+        # -----------------------------------
+        if board.is_checkmate():
+            return -MATE if board.turn == chess.WHITE else MATE
+
+        if board.is_stalemate() or board.is_insufficient_material():
+            return 0
+
+        if depth == 0:
+            return self.quiescence(board, alpha, beta)
+
+        # -----------------------------------
+        # MOVE ORDERING
+        # -----------------------------------
+        legal_moves = self.order_moves(board, list(board.legal_moves), depth)
+
+        # ======================================================
+        # MAX NODE
+        # ======================================================
         if is_maximizing:
 
-            max_eval = -float("inf")
+            max_eval = -MATE
 
             for move in legal_moves:
 
                 board.push(move)
-                eval_score = self.alphabeta(board, depth - 1, alpha, beta, False)
+                eval_score = self.alphabeta(
+                    board,
+                    depth - 1,
+                    alpha,
+                    beta,
+                    False
+                )
                 board.pop()
 
                 max_eval = max(max_eval, eval_score)
                 alpha = max(alpha, eval_score)
 
-                # PRUNE
+                # -------------------------
+                # CUTOFF
+                # -------------------------
                 if beta <= alpha:
+
+                    move_key = move.uci()
+
+                    # HISTORY HEURISTIC
+                    if move_key not in self.history:
+                        self.history[move_key] = 0
+                    self.history[move_key] += depth * depth
+
+                    # KILLER MOVES
+                    depth_key = depth
+
+                    if depth_key not in self.killer_moves:
+                        self.killer_moves[depth_key] = []
+
+                    if move not in self.killer_moves[depth_key]:
+                        self.killer_moves[depth_key].insert(0, move)
+
+                    self.killer_moves[depth_key] = self.killer_moves[depth_key][:2]
+
                     break
 
+            self.tt[key] = (depth, max_eval)
             return max_eval
 
+        # ======================================================
+        # MIN NODE
+        # ======================================================
         else:
 
-            min_eval = float("inf")
+            min_eval = MATE
 
             for move in legal_moves:
 
                 board.push(move)
-                eval_score = self.alphabeta(board, depth - 1, alpha, beta, True)
+                eval_score = self.alphabeta(
+                    board,
+                    depth - 1,
+                    alpha,
+                    beta,
+                    True
+                )
                 board.pop()
 
                 min_eval = min(min_eval, eval_score)
                 beta = min(beta, eval_score)
 
-                # PRUNE
+                # -------------------------
+                # CUTOFF
+                # -------------------------
                 if beta <= alpha:
+
+                    move_key = move.uci()
+
+                    # HISTORY HEURISTIC
+                    if move_key not in self.history:
+                        self.history[move_key] = 0
+                    self.history[move_key] += depth * depth
+
+                    # KILLER MOVES
+                    depth_key = depth
+
+                    if depth_key not in self.killer_moves:
+                        self.killer_moves[depth_key] = []
+
+                    if move not in self.killer_moves[depth_key]:
+                        self.killer_moves[depth_key].insert(0, move)
+
+                    self.killer_moves[depth_key] = self.killer_moves[depth_key][:2]
+
                     break
 
+            self.tt[key] = (depth, min_eval)
             return min_eval
 
     # ==========================================
     # GET BEST MOVE
     # ==========================================
-    def get_move(self, board: chess.Board):
-
-        print(f"[ENGINE EVAL ROOT] {self.evaluate(board)}")
+    def get_move(self, board):
 
         legal_moves = list(board.legal_moves)
 
         if not legal_moves:
+            print("[ENGINE] No legal moves!")
             return None
 
-        best_move = None
-
+        best_move = legal_moves[0]   # IMPORTANT fallback
         is_maximizing = (board.turn == chess.WHITE)
 
         best_value = -float("inf") if is_maximizing else float("inf")
 
         alpha = -float("inf")
         beta = float("inf")
+
+        print(f"[ENGINE ROOT] evaluating {len(legal_moves)} moves")
 
         for move in legal_moves:
 
@@ -180,21 +497,15 @@ class ClassicalEngine:
 
             print(f"Move {move} -> {value}")
 
+            # FORCE SAFE COMPARISON (important)
             if is_maximizing:
-
                 if value > best_value:
                     best_value = value
                     best_move = move
-
-                alpha = max(alpha, value)
-
             else:
-
                 if value < best_value:
                     best_value = value
                     best_move = move
-
-                beta = min(beta, value)
 
         print(f"[ENGINE CHOSEN] {best_move} with value {best_value}")
 

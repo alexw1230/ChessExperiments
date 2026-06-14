@@ -1,5 +1,6 @@
 import pygame
 import chess
+import chess.pgn
 from engines.classical import ClassicalEngine
 
 # ==========================================
@@ -27,8 +28,14 @@ pygame.display.set_caption("Chess")
 
 font = pygame.font.SysFont(None, 40)
 engine_pending = False
+game = chess.pgn.Game()
+node = game
 board = chess.Board()
 engine = ClassicalEngine()
+game.headers["Event"] = "Engine Game"
+game.headers["Site"] = "Local"
+game.headers["White"] = "Engine" if ENGINE_COLOR == chess.WHITE else "Human"
+game.headers["Black"] = "Engine" if ENGINE_COLOR == chess.BLACK else "Human"
 
 game_over = False
 result_text = ""
@@ -55,7 +62,7 @@ piece_map = {
 }
 
 for piece, filename in piece_map.items():
-    img = pygame.image.load(f"assets2/{filename}")
+    img = pygame.image.load(f"assets/{filename}")
     img = pygame.transform.smoothscale(img, (PIECE_SIZE, PIECE_SIZE))
     piece_images[piece] = img
 
@@ -196,9 +203,13 @@ def show_promotion_menu():
 # ==========================================
 # ENGINE
 # ==========================================
+def save_game_pgn(game, filename="engine_game.pgn"):
+    with open(filename, "w", encoding="utf-8") as f:
+        exporter = chess.pgn.FileExporter(f)
+        game.accept(exporter)
 
 def make_engine_move():
-
+    global node
     if game_over:
         return
 
@@ -212,6 +223,7 @@ def make_engine_move():
 
     if move in board.legal_moves:
         board.push(move)
+        node = node.add_variation(move)
         check_game_over()
 
 # ==========================================
@@ -326,6 +338,7 @@ while running:
 
                 if move in board.legal_moves:
                     board.push(move)
+                    node = node.add_variation(move)
                     check_game_over()
                     engine_pending = True
 
@@ -354,5 +367,5 @@ while running:
 
     if game_over:
         show_game_over_popup()
-
+save_game_pgn(game, f"results/game1.pgn")
 pygame.quit()

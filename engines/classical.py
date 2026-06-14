@@ -411,9 +411,14 @@ class ClassicalEngine:
         # TRANSPOSITION TABLE LOOKUP (simple)
         # -----------------------------------
             if depth >= 3 and key in self.tt:
-                stored_depth, stored_value = self.tt[key]
-                if stored_depth >= depth:
-                    return stored_value
+                entry = self.tt[key]
+
+                if len(entry) >= 2:
+                    stored_depth = entry[0]
+                    stored_value = entry[1]
+
+                    if stored_depth >= depth:
+                        return stored_value
 
         # -----------------------------------
         # TERMINAL / LEAF CONDITIONS
